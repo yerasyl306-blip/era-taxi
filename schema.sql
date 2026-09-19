@@ -1,0 +1,14 @@
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,phone TEXT UNIQUE NOT NULL,name TEXT NOT NULL,role TEXT NOT NULL,salt TEXT NOT NULL,hash TEXT NOT NULL,deleted INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT REFERENCES users(id),expires INTEGER);
+CREATE INDEX IF NOT EXISTS session_user ON sessions(userId);
+CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,passengerId TEXT REFERENCES users(id),driverId TEXT REFERENCES users(id),state TEXT NOT NULL,payload TEXT NOT NULL,price INTEGER NOT NULL,created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS order_passenger ON orders(passengerId,created);
+CREATE INDEX IF NOT EXISTS order_driver ON orders(driverId,created);
+CREATE INDEX IF NOT EXISTS order_state ON orders(state,created);
+CREATE TABLE IF NOT EXISTS offers(id TEXT PRIMARY KEY,orderId TEXT REFERENCES orders(id),driverId TEXT REFERENCES users(id),price INTEGER,UNIQUE(orderId,driverId));
+CREATE TABLE IF NOT EXISTS journal(id TEXT PRIMARY KEY,userId TEXT REFERENCES users(id),day TEXT,startKm INTEGER,endKm INTEGER,fuel INTEGER,income INTEGER,UNIQUE(userId,day));
+CREATE TABLE IF NOT EXISTS ledger(orderId TEXT PRIMARY KEY REFERENCES orders(id),driverId TEXT REFERENCES users(id),gross INTEGER NOT NULL,commission INTEGER NOT NULL,net INTEGER NOT NULL,created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS ledger_driver_created ON ledger(driverId,created);
+CREATE TABLE IF NOT EXISTS locations(orderId TEXT PRIMARY KEY REFERENCES orders(id),driverId TEXT REFERENCES users(id),lat REAL,lon REAL,accuracy REAL,updated INTEGER);
+CREATE TABLE IF NOT EXISTS limits(key TEXT PRIMARY KEY,n INTEGER,expires INTEGER);
