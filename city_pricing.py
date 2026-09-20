@@ -22,7 +22,7 @@ def waiting_fare(elapsed_ms):
  # First 60 seconds free. Remaining time prorated; round once to whole tenge.
  return (max(0,int(elapsed_ms)-60000)*25+30000)//60000
 
-def route_metres(a,b):
+def route_details(a,b):
  global _last_request
  base=os.environ.get('ROUTING_URL','https://routing.openstreetmap.de/routed-car/route/v1/driving').rstrip('/')
  url=f"{base}/{a['lon']},{a['lat']};{b['lon']},{b['lat']}?overview=false&alternatives=false&steps=false&radiuses=150;150"
@@ -34,5 +34,23 @@ def route_metres(a,b):
   with urllib.request.urlopen(req,timeout=15) as response:data=json.load(response)
  if data.get('code')!='Ok' or not data.get('routes'):raise ValueError('Route unavailable')
  distance=data['routes'][0]['distance']
- if not math.isfinite(distance) or not 100<=distance<=60000:raise ValueError('Route outside service limits')
- return int(distance+0.5)
+ if not math.isfinite(distance) or not 0<=distance<=60000:raise ValueError('Route outside service limits')
+ return {'distanceM':int(distance+0.5),'seconds':int(data['routes'][0]['duration']+0.5)}
+
+
+def route_metres(a,b):
+ result=route_details(a,b)
+ if result['distanceM']<100:raise ValueError('Route too short')
+ return result['distanceM']
+
+_eta_cache={}
+def arrival_eta(order_id,location,pickup):
+ if not location or not pickup:return None
+ cached=_eta_cache.get(order_id)
+ if cached and time.monotonic()-cached[0]<30:return cached[1]
+ try:
+  minutes=max(1,math.ceil(route_details(location,pickup)['seconds']/60))
+ except Exception:minutes=None
+ if len(_eta_cache)>500:_eta_cache.clear()
+ _eta_cache[order_id]=(time.monotonic(),minutes)
+ return minutes
