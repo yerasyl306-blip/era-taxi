@@ -4,13 +4,14 @@ from contextlib import contextmanager,asynccontextmanager
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
 from fastapi import FastAPI,Request
+from city_pricing import TARIFFS,in_service,route_metres,distance_fare,waiting_fare,metres
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 ROOT=Path(__file__).parent
 DB=Path(os.environ.get('DATA_DIR',str(ROOT/'data')))/'taxi.sqlite'
-CITIES={'Ынталы','Қаражон','Түркістан','Кентау'}
+CITIES={'Түркістан'}
 TZ=timezone(timedelta(hours=5))
 def now(): return int(time.time()*1000)
 def uid(): return secrets.token_hex(16)
@@ -71,12 +72,15 @@ def view(db,o,u):
   for k in ['pickup','destination','address','destinationAddress']:p.pop(k,None)
  o['payload']=p;o['offers']=[f for f in allrows(db,'SELECT o.*,u.name FROM offers o JOIN users u ON u.id=o.driverId WHERE orderId=?',o['id']) if u['id']==o['passengerId'] or u['id']==f['driverId']]
  o['contact']=one(db,'SELECT phone,name FROM users WHERE id=?',o['passengerId'] if u['role']=='driver' else o['driverId']) if participant and o['driverId'] else None
+ w=one(db,'SELECT * FROM waiting WHERE orderId=?',o['id']);o['waiting']=None
+ if w:
+  elapsed=max(0,(w['ended'] if w['ended'] is not None else now())-w['started']);o['waiting']={'elapsedMs':elapsed,'active':w['ended'] is None,'fee':w['fee'] if w['ended'] is not None else waiting_fare(elapsed)}
  o['commission']=(o['price']*5+50)//100;o['driverNet']=o['price']-o['commission'];return o
 @app.api_route('/api/{path:path}',methods=['GET','POST','PUT','DELETE'])
 def api(path:str,req:Request,b:dict=None):
  b=b or {};method=req.method
  with connection() as db:
-  if path=='health': return {'ok':True,'commission':5,'runtime':'python','locationTtlSeconds':45}
+  if path=='health': return {'ok':True,'commission':5,'runtime':'python','locationTtlSeconds':45,'version':'0.3.0','city':'Түркістан'}
   rate(db,((req.client.host if req.client else 'unknown')+':auth') if path in ['register','login'] else req.headers.get('authorization',req.client.host if req.client else 'unknown'),20 if path in ['register','login'] else 300)
   if path in ['register','login'] and method=='POST':
    phone=re.sub(r'[\s()+-]','',text(b.get('phone')));must(re.fullmatch(r'7\d{10}',phone),'Телефон +7 және 10 сан болсын')
@@ -96,18 +100,30 @@ def api(path:str,req:Request,b:dict=None):
   if path=='orders' and method=='GET':
    sql='SELECT * FROM orders WHERE passengerId=? ORDER BY created DESC LIMIT 100' if u['role']=='passenger' else "SELECT * FROM orders WHERE state='open' OR driverId=? ORDER BY created DESC LIMIT 100"
    return [view(db,o,u) for o in allrows(db,sql,u['id'])]
+  if path=='quote' and method=='POST':
+   must(u['role']=='passenger');must(b.get('tariff') in TARIFFS,'Тариф дұрыс емес')
+   a=point(b.get('pickup'));d=point(b.get('destination'));must(in_service(a) and in_service(d),'Тек Түркістан қызмет аумағы: орталықтан 12 км')
+   rate(db,'routing:'+u['id'],8)
+   try:distance=route_metres(a,d)
+   except Exception:raise Problem('Жол бағыты есептелмеді. Кейінірек қайталаңыз.',503)
+   q={'tariff':b['tariff'],'pickup':a,'destination':d,'distanceM':distance,'price':distance_fare(distance,b['tariff']),'ratePerKm':TARIFFS[b['tariff']]}
+   qid=uid();db.execute('DELETE FROM quotes WHERE expires<?',(now(),));db.execute('INSERT INTO quotes VALUES(?,?,?,?)',(qid,u['id'],json.dumps(q),now()+600000));db.commit()
+   return {**q,'quoteId':qid,'expiresAt':now()+600000}
   if path=='orders' and method=='POST':
-   must(u['role']=='passenger');f,t=b.get('from'),b.get('to');must(f in CITIES and t in CITIES and f!=t and ({f,t}&{'Түркістан','Кентау'}),'Бағыт дұрыс емес');must(b.get('tariff') in ['taxi','salon','cargo'],'Тариф дұрыс емес');number(b.get('price'))
-   try:when=datetime.fromisoformat(b['when'].replace('Z','+00:00'));stamp=int(when.timestamp()*1000)
+   must(u['role']=='passenger');key=text(b.get('id'),64);must(re.fullmatch(r'[a-zA-Z0-9-]+',key),'ID дұрыс емес')
+   db.execute('BEGIN IMMEDIATE');prior=one(db,'SELECT * FROM orders WHERE id=?',key)
+   if prior:
+    must(prior['passengerId']==u['id'] and json.loads(prior['payload']).get('quoteId')==b.get('quoteId'),'Қайталанған сұрау өзгерген',409)
+    return view(db,prior,u)
+   quote=one(db,'SELECT * FROM quotes WHERE id=? AND userId=? AND expires>?',b.get('quoteId'),u['id'],now());must(quote,'Алдымен маршрут бағасын есептеңіз',409);q=json.loads(quote['payload'])
+   must(b.get('from')=='Түркістан' and b.get('to')=='Түркістан' and b.get('tariff')==q['tariff'],'Тек Түркістан ішіндегі сапар')
+   must(b.get('pickup')==q['pickup'] and b.get('destination')==q['destination'],'Мекенжай өзгерді. Бағаны қайта есептеңіз',409)
+   try:stamp=int(datetime.fromisoformat(b['when'].replace('Z','+00:00')).timestamp()*1000)
    except (ValueError,KeyError,TypeError):raise Problem('Уақыт дұрыс емес')
    must(now()-60000<=stamp<now()+30*86400000,'Уақыт алдағы 30 күнде болсын')
-   p={k:b.get(k) for k in ['from','to','tariff','when']};p.update(address=text(b.get('address')),destinationAddress=text(b.get('destinationAddress')),pickup=point(b.get('pickup')),destination=point(b.get('destination')),note=text(b['note'],500) if b.get('note') else '')
-   p['requestedPrice']=b['price'];payload=json.dumps(p,ensure_ascii=False,sort_keys=True);key=text(b.get('id'),64);must(re.fullmatch(r'[a-zA-Z0-9-]+',key),'ID дұрыс емес')
-   db.execute('BEGIN IMMEDIATE');prior=one(db,'SELECT * FROM orders WHERE id=?',key)
-   if prior:must(prior['passengerId']==u['id'] and prior['payload']==payload,'Қайталанған сұрау өзгерген',409)
-   else:db.execute("INSERT INTO orders VALUES(?,?,NULL,'open',?,?,?)",(key,u['id'],payload,b['price'],now()))
-   db.commit();return view(db,one(db,'SELECT * FROM orders WHERE id=?',key),u)
-  match=re.fullmatch(r'orders/([^/]+)/(offers|accept|start|complete|cancel|location)',path)
+   p={k:b.get(k) for k in ['from','to','tariff','when','quoteId']};p.update(address=text(b.get('address')),destinationAddress=text(b.get('destinationAddress')),pickup=q['pickup'],destination=q['destination'],note=text(b['note'],500) if b.get('note') else '',distanceM=q['distanceM'],baseFare=q['price'],pricingVersion=1)
+   db.execute("INSERT INTO orders VALUES(?,?,NULL,'open',?,?,?)",(key,u['id'],json.dumps(p,ensure_ascii=False),q['price'],now()));db.execute('DELETE FROM quotes WHERE id=?',(quote['id'],));db.commit();return view(db,one(db,'SELECT * FROM orders WHERE id=?',key),u)
+  match=re.fullmatch(r'orders/([^/]+)/(offers|accept|arrive|start|complete|cancel|location)',path)
   if match:
    oid,action=match.groups();db.execute('BEGIN IMMEDIATE');o=one(db,'SELECT * FROM orders WHERE id=?',oid);must(o,'Тапсырыс табылмады',404)
    if action=='location':
@@ -123,17 +139,26 @@ def api(path:str,req:Request,b:dict=None):
    else:
     must(method=='POST','Әдіс қолжетімсіз',405)
     if action=='offers':
-     must(u['role']=='driver');must(o['state']=='open','Тапсырыс жабық',409);number(b.get('price'));db.execute('INSERT INTO offers VALUES(?,?,?,?) ON CONFLICT(orderId,driverId) DO UPDATE SET price=excluded.price',(uid(),oid,u['id'],b['price']))
+     must(u['role']=='driver');must(o['state']=='open','Тапсырыс жабық',409);p=json.loads(o['payload']);must(p.get('pricingVersion')==1,'Ескі тапсырыс: жаңа нұсқада қайта жасаңыз',409);b['price']=o['price'];db.execute('INSERT INTO offers VALUES(?,?,?,?) ON CONFLICT(orderId,driverId) DO UPDATE SET price=excluded.price',(uid(),oid,u['id'],b['price']))
     elif action=='accept':
      must(o['passengerId']==u['id']);offer=one(db,'SELECT * FROM offers WHERE id=? AND orderId=?',b.get('offerId'),oid);must(offer,'Ұсыныс жоқ');must(o['state']=='open' or (o['state']=='accepted' and o['driverId']==offer['driverId']),'Тапсырыс жабық',409)
      if o['state']=='open':db.execute("UPDATE orders SET driverId=?,price=?,state='accepted' WHERE id=?",(offer['driverId'],offer['price'],oid))
+    elif action=='arrive':
+     must(o['driverId']==u['id']);must(o['state']=='accepted','Күту тек келісілген сапарға қосылады',409)
+     p=json.loads(o['payload']);loc=one(db,'SELECT * FROM locations WHERE orderId=? AND updated>?',oid,now()-45000)
+     must(loc and loc['accuracy']<=100 and p.get('pickup') and metres(loc,p['pickup'])<=200,'Алатын нүктеге жақындап, нақты GPS бөлісуді қосыңыз',409)
+     db.execute('INSERT OR IGNORE INTO waiting(orderId,started) VALUES(?,?)',(oid,now()))
     elif action in ['start','complete']:
      must(o['driverId']==u['id']);target='in_progress' if action=='start' else 'completed';source='accepted' if action=='start' else 'in_progress';must(o['state'] in [source,target],'Сапар күйі сәйкес емес',409)
+     if action=='start' and o['state']=='accepted':
+      w=one(db,'SELECT * FROM waiting WHERE orderId=?',oid)
+      if w and w['ended'] is None:
+       end=now();fee=waiting_fare(end-w['started']);db.execute('UPDATE waiting SET ended=?,fee=? WHERE orderId=?',(end,fee,oid));db.execute('UPDATE orders SET price=price+? WHERE id=?',(fee,oid))
      db.execute('UPDATE orders SET state=? WHERE id=?',(target,oid))
      if action=='complete':
       fee=(o['price']*5+50)//100;db.execute('INSERT OR IGNORE INTO ledger VALUES(?,?,?,?,?,?)',(oid,u['id'],o['price'],fee,o['price']-fee,now()));db.execute('DELETE FROM locations WHERE orderId=?',(oid,))
     elif action=='cancel':
-     must(u['id'] in [o['passengerId'],o['driverId']]);must(o['state'] in ['open','accepted','cancelled'],'Сапарды тоқтату мүмкін емес',409);db.execute("UPDATE orders SET state='cancelled' WHERE id=?",(oid,));db.execute('DELETE FROM locations WHERE orderId=?',(oid,))
+     must(u['id'] in [o['passengerId'],o['driverId']]);must(o['state'] in ['open','accepted','cancelled'],'Сапарды тоқтату мүмкін емес',409);db.execute("UPDATE orders SET state='cancelled' WHERE id=?",(oid,));db.execute('UPDATE waiting SET ended=COALESCE(ended,?),fee=0 WHERE orderId=?',(now(),oid));db.execute('DELETE FROM locations WHERE orderId=?',(oid,))
    db.commit();return {'ok':True}
   if path in ['journal','report','ledger']:
    must(u['role']=='driver')
@@ -153,7 +178,7 @@ def api(path:str,req:Request,b:dict=None):
     return {'income':income,'fuel':fuel,'commission':fee,'net':income-fuel-fee,'km':sum(x['endKm']-x['startKm'] for x in rows),'days':len(rows)}
   if path=='me' and method=='DELETE':
    db.execute('BEGIN IMMEDIATE');must(not one(db,"SELECT id FROM orders WHERE (passengerId=? OR driverId=?) AND state IN ('open','accepted','in_progress')",u['id'],u['id']),'Белсенді сапарларды аяқтаңыз',409)
-   db.execute('DELETE FROM sessions WHERE userId=?',(u['id'],));db.execute('DELETE FROM journal WHERE userId=?',(u['id'],));db.execute('DELETE FROM offers WHERE driverId=?',(u['id'],));db.execute('DELETE FROM locations WHERE driverId=?',(u['id'],));db.execute('UPDATE users SET phone=?,name=?,salt=?,hash=?,deleted=1 WHERE id=?',('deleted-'+uid(),'Жойылған пайдаланушы',uid(),uid(),u['id']))
+   db.execute('DELETE FROM quotes WHERE userId=?',(u['id'],));db.execute('DELETE FROM sessions WHERE userId=?',(u['id'],));db.execute('DELETE FROM journal WHERE userId=?',(u['id'],));db.execute('DELETE FROM offers WHERE driverId=?',(u['id'],));db.execute('DELETE FROM locations WHERE driverId=?',(u['id'],));db.execute('UPDATE users SET phone=?,name=?,salt=?,hash=?,deleted=1 WHERE id=?',('deleted-'+uid(),'Жойылған пайдаланушы',uid(),uid(),u['id']))
    for old in allrows(db,'SELECT id,payload FROM orders WHERE passengerId=?',u['id']):
     p=json.loads(old['payload']);p.update(address='Жойылған',destinationAddress='Жойылған',pickup=None,destination=None,note='');db.execute('UPDATE orders SET payload=? WHERE id=?',(json.dumps(p,ensure_ascii=False),old['id']))
    db.commit();return {'ok':True}

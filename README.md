@@ -1,15 +1,10 @@
-# Ынталы Такси — Python shared server
-
-FastAPI, SQLite on a persistent disk, one Uvicorn worker. Phone/password accounts (no SMS verification), passenger orders, driver offers, private foreground location sharing, driver journal and 5% completed-trip commission ledger.
-
-Install: `pip install -r requirements.txt`
-
-Start: `uvicorn main:app --host 0.0.0.0 --port 10000 --workers 1 --no-access-log`
-
-Required hosted setting: `DATA_DIR=/var/data`; attach a persistent disk at `/var/data`. Do not use ephemeral disk for real users. `ALLOWED_ORIGINS` accepts comma-separated HTTPS website origins. Android appassets and the published Yntaly Site are already allowed.
-
-The latest GPS point is visible only to the assigned passenger and driver during an accepted/in-progress ride. It expires after 45 seconds and is removed on completion, cancellation, logout, or sharing stop. No location history is collected. GPS sharing requires driver consent and the app to stay in the foreground.
-
-5% commission is rounded to the nearest whole tenge, half up, and recorded exactly once per completed order. It is an accounting entry, not an automatic charge. Fare payment and commission collection are not integrated.
-
-Before public operation supply operator contact details and hosting/retention policy. Password reset and SMS verification are not implemented. Keep regular encrypted backups of the persistent database and restrict access to the hosting account. For horizontal scaling, migrate SQLite to PostgreSQL.
+# Turkistan city taxi 0.3.0
+Python FastAPI, SQLite persistent disk DATA_DIR=/app/data. One Uvicorn worker.
+Rates per road km: vmeste70 econom85 comfort90 comfort_plus100 KZT. Pilot service radius12km from Turkistan center43.3019457,68.2703698, not official municipal boundary.
+POST /api/quote: authenticated passenger, tariff and two coordinates. FOSSGIS OSRM road distance, serialized <=1req/s, no straight-line fallback; ROUTING_URL configurable. Quote valid10min, consumed transactionally. Driver offers use fixed quote, client price ignored.
+POST orders/{id}/arrive: assigned driver, accepted ride, fresh GPS <=100m accuracy within200m of pickup. Waiting free60sec then25KZT/min prorated and rounded to whole tenge. Start freezes fare. Cancellation waives waiting. Idempotent start/complete; 5% ledger once.
+Vmeste is tariff label only, no ride pooling. Existing intercity data preserved, no new offers for old orders. Upgrade APK0.3.0.
+Railway trial only, persistent500MB volume, US region. No SMS or password reset, no automated payments. Operator contact details remain incomplete.
+GPS only assigned participants, foreground, TTL45s. Routing privacy and OSM attribution: https://routing.openstreetmap.de/about.html
+Run: uvicorn main:app --host 0.0.0.0 --port 8080 --workers 1 --no-access-log
+Tests: python -m unittest test_api.py
