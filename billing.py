@@ -1,6 +1,6 @@
 """Manual bank reconciliation: OCR is advisory, never payment authorization."""
 import base64,hashlib,hmac,os,secrets,re,sqlite3
-import rural
+import rural,profile_site
 from fastapi.responses import Response
 
 HOURS=14*60*60*1000
@@ -39,6 +39,7 @@ def handle(path,method,b,req,db,u,now,must,uid,digest,password):
  if path.startswith('admin/'):
   token=req.headers.get('authorization','').removeprefix('Bearer ')
   must(db.execute('SELECT 1 FROM admin_sessions WHERE token=? AND expires>?',(digest(token),now)).fetchone(),'Админ ретінде кіріңіз',401)
+  if path.startswith('admin/site/'):return profile_site.admin(path,method,b,db,now,must,uid)
   if path.startswith('admin/rural/'):return rural.admin(path,method,b,db,now,must,uid)
   if path=='admin/logout':db.execute('DELETE FROM admin_sessions WHERE token=?',(digest(token),));db.commit();return {'ok':True}
   if path=='admin/summary':

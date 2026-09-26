@@ -4,7 +4,7 @@ from contextlib import contextmanager,asynccontextmanager
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
 from fastapi import FastAPI,Request
-import billing,rural
+import billing,rural,profile_site
 from city_pricing import TARIFFS,in_service,route_metres,distance_fare,waiting_fare,metres,arrival_eta
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,7 +41,7 @@ def one(db,sql,*args):
 def allrows(db,sql,*args): return [dict(r) for r in db.execute(sql,args)]
 def initialize():
  DB.parent.mkdir(parents=True,exist_ok=True)
- with connection() as db: db.executescript((ROOT/'schema.sql').read_text());db.executescript(billing.DDL);db.executescript(rural.DDL);db.commit()
+ with connection() as db: db.executescript((ROOT/'schema.sql').read_text());db.executescript(billing.DDL);db.executescript(rural.DDL);db.executescript(profile_site.DDL);db.commit()
 @asynccontextmanager
 async def lifespan(app): initialize();yield
 app=FastAPI(lifespan=lifespan,docs_url=None,redoc_url=None)
@@ -52,7 +52,7 @@ async def problem_handler(req,e): return JSONResponse({'error':e.message},status
 @app.middleware('http')
 async def bounded(req,call_next):
  if req.url.path.startswith('/api/'):
-  limit=4300000 if req.url.path in ['/api/billing/receipt','/api/rural/receipt'] else 32768
+  limit=4300000 if req.url.path in ['/api/billing/receipt','/api/rural/receipt','/api/admin/site/profile','/api/admin/site/post'] else 32768
   if int(req.headers.get('content-length','0'))>limit: return JSONResponse({'error':'Сұрау тым үлкен'},status_code=413)
   raw=await req.body()
   if len(raw)>limit:return JSONResponse({'error':'Сұрау тым үлкен'},status_code=413)
@@ -85,6 +85,8 @@ def api(path:str,req:Request,b:dict=None):
  with connection() as db:
   if path=='health': return {'ok':True,'runtime':'python','locationTtlSeconds':45,'version':'0.5.0','city':'Түркістан'}
   rate(db,((req.client.host if req.client else 'unknown')+':auth') if path in ['register','login'] else req.headers.get('authorization',req.client.host if req.client else 'unknown'),20 if path in ['register','login'] else 300)
+  if path=='site' and method=='GET':return profile_site.public(db)
+  if path.startswith('site/media/') and method=='GET':return profile_site.media(db,path.rsplit('/',1)[-1],must)
   if path in ['register','login'] and method=='POST':
    phone=re.sub(r'[\s()+-]','',text(b.get('phone')));must(re.fullmatch(r'7\d{10}',phone),'Телефон +7 және 10 сан болсын')
    pw=b.get('password');must(isinstance(pw,str) and 8<=len(pw)<=128,'Құпиясөз 8–128 таңба болсын')
