@@ -4,7 +4,7 @@ from contextlib import contextmanager,asynccontextmanager
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
 from fastapi import FastAPI,Request
-import billing
+import billing,rural
 from city_pricing import TARIFFS,in_service,route_metres,distance_fare,waiting_fare,metres,arrival_eta
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,7 +41,7 @@ def one(db,sql,*args):
 def allrows(db,sql,*args): return [dict(r) for r in db.execute(sql,args)]
 def initialize():
  DB.parent.mkdir(parents=True,exist_ok=True)
- with connection() as db: db.executescript((ROOT/'schema.sql').read_text());db.executescript(billing.DDL);db.commit()
+ with connection() as db: db.executescript((ROOT/'schema.sql').read_text());db.executescript(billing.DDL);db.executescript(rural.DDL);db.commit()
 @asynccontextmanager
 async def lifespan(app): initialize();yield
 app=FastAPI(lifespan=lifespan,docs_url=None,redoc_url=None)
@@ -52,7 +52,7 @@ async def problem_handler(req,e): return JSONResponse({'error':e.message},status
 @app.middleware('http')
 async def bounded(req,call_next):
  if req.url.path.startswith('/api/'):
-  limit=4300000 if req.url.path=='/api/billing/receipt' else 32768
+  limit=4300000 if req.url.path in ['/api/billing/receipt','/api/rural/receipt'] else 32768
   if int(req.headers.get('content-length','0'))>limit: return JSONResponse({'error':'Сұрау тым үлкен'},status_code=413)
   raw=await req.body()
   if len(raw)>limit:return JSONResponse({'error':'Сұрау тым үлкен'},status_code=413)
@@ -83,7 +83,7 @@ def view(db,o,u):
 def api(path:str,req:Request,b:dict=None):
  b=b or {};method=req.method
  with connection() as db:
-  if path=='health': return {'ok':True,'runtime':'python','locationTtlSeconds':45,'version':'0.4.0','city':'Түркістан'}
+  if path=='health': return {'ok':True,'runtime':'python','locationTtlSeconds':45,'version':'0.5.0','city':'Түркістан'}
   rate(db,((req.client.host if req.client else 'unknown')+':auth') if path in ['register','login'] else req.headers.get('authorization',req.client.host if req.client else 'unknown'),20 if path in ['register','login'] else 300)
   if path in ['register','login'] and method=='POST':
    phone=re.sub(r'[\s()+-]','',text(b.get('phone')));must(re.fullmatch(r'7\d{10}',phone),'Телефон +7 және 10 сан болсын')
@@ -101,7 +101,8 @@ def api(path:str,req:Request,b:dict=None):
    return billing.handle(path,method,b,req,db,None,now(),must,uid,digest,password)
   u=user(db,req)
   if u['role']=='driver':
-   billing.cycle(db,u['id'],now());db.commit()
+   billing.cycle(db,u['id'],now());rural.rollover(db,now());db.commit()
+  if path.startswith('rural/'):return rural.handle(path,method,b,db,u,now(),must,uid)
   if path in ['billing','billing/receipt']:return billing.handle(path,method,b,req,db,u,now(),must,uid,digest,password)
   if path=='me' and method=='GET':return u
   if path=='logout' and method=='POST':
@@ -129,10 +130,7 @@ def api(path:str,req:Request,b:dict=None):
    quote=one(db,'SELECT * FROM quotes WHERE id=? AND userId=? AND expires>?',b.get('quoteId'),u['id'],now());must(quote,'Алдымен маршрут бағасын есептеңіз',409);q=json.loads(quote['payload'])
    must(b.get('from')=='Түркістан' and b.get('to')=='Түркістан' and b.get('tariff')==q['tariff'],'Тек Түркістан ішіндегі сапар')
    must(b.get('pickup')==q['pickup'] and b.get('destination')==q['destination'],'Мекенжай өзгерді. Бағаны қайта есептеңіз',409)
-   try:stamp=int(datetime.fromisoformat(b['when'].replace('Z','+00:00')).timestamp()*1000)
-   except (ValueError,KeyError,TypeError):raise Problem('Уақыт дұрыс емес')
-   must(now()-60000<=stamp<now()+30*86400000,'Уақыт алдағы 30 күнде болсын')
-   p={k:b.get(k) for k in ['from','to','tariff','when','quoteId']};p.update(address=text(b.get('address')),destinationAddress=text(b.get('destinationAddress')),pickup=q['pickup'],destination=q['destination'],note=text(b['note'],500) if b.get('note') else '',distanceM=q['distanceM'],baseFare=q['price'],pricingVersion=1)
+   p={k:b.get(k) for k in ['from','to','tariff','quoteId']};p.update(when=datetime.fromtimestamp(now()/1000,TZ).isoformat(),immediate=True,address=text(b.get('address')),destinationAddress=text(b.get('destinationAddress')),pickup=q['pickup'],destination=q['destination'],note=text(b['note'],500) if b.get('note') else '',distanceM=q['distanceM'],baseFare=q['price'],pricingVersion=1)
    db.execute("INSERT INTO orders VALUES(?,?,NULL,'open',?,?,?)",(key,u['id'],json.dumps(p,ensure_ascii=False),q['price'],now()));db.execute('DELETE FROM quotes WHERE id=?',(quote['id'],));db.commit();return view(db,one(db,'SELECT * FROM orders WHERE id=?',key),u)
   match=re.fullmatch(r'orders/([^/]+)/(offers|accept|take|dismiss|arrive|start|complete|cancel|location)',path)
   if match:
@@ -154,6 +152,7 @@ def api(path:str,req:Request,b:dict=None):
     if action=='dismiss':
      must(u['role']=='driver');must(o['state']=='open','Тапсырыс жабық',409);db.execute('INSERT OR IGNORE INTO dismissed VALUES(?,?)',(oid,u['id']))
     elif action=='take':
+     must(not one(db,"SELECT 1 FROM rural_queue WHERE driverId=? AND state IN ('queued','departed')",u['id']),'Алдымен ауыл кезегінен шығыңыз немесе сапарды аяқтаңыз',409)
      must(u['role']=='driver');must(json.loads(o['payload']).get('pricingVersion')==1,'Ескі тапсырысты қайта жасаңыз',409);must(not billing.cycle(db,u['id'],now())['blocked'],'Комиссияны төлеп, растауды күтіңіз',402);must(o['state']=='open' or o['driverId']==u['id'],'Тапсырысты басқа жүргізуші алды',409)
      if o['state']=='open':
       must(not one(db,"SELECT id FROM orders WHERE driverId=? AND state IN ('accepted','in_progress')",u['id']),'Алдымен белсенді сапарды аяқтаңыз',409)
@@ -163,6 +162,7 @@ def api(path:str,req:Request,b:dict=None):
      must(u['role']=='driver');must(o['state']=='open','Тапсырыс жабық',409);p=json.loads(o['payload']);must(p.get('pricingVersion')==1,'Ескі тапсырыс: жаңа нұсқада қайта жасаңыз',409);b['price']=o['price'];db.execute('INSERT INTO offers VALUES(?,?,?,?) ON CONFLICT(orderId,driverId) DO UPDATE SET price=excluded.price',(uid(),oid,u['id'],b['price']))
     elif action=='accept':
      must(o['passengerId']==u['id']);offer=one(db,'SELECT * FROM offers WHERE id=? AND orderId=?',b.get('offerId'),oid);must(offer,'Ұсыныс жоқ');must(o['state']=='open' or (o['state']=='accepted' and o['driverId']==offer['driverId']),'Тапсырыс жабық',409)
+     must(not one(db,"SELECT 1 FROM rural_queue WHERE driverId=? AND state IN ('queued','departed')",offer['driverId']),'Жүргізуші ауыл бағытында',409)
      must(not billing.cycle(db,offer['driverId'],now())['blocked'],'Жүргізуші қазір қолжетімсіз',409)
      if o['state']=='open':
        must(not one(db,"SELECT id FROM orders WHERE driverId=? AND state IN ('accepted','in_progress')",offer['driverId']),'Жүргізуші басқа сапарда',409)
@@ -201,7 +201,8 @@ def api(path:str,req:Request,b:dict=None):
     rows=allrows(db,'SELECT * FROM journal WHERE userId=? AND day BETWEEN ? AND ?',u['id'],str(start),str(end));income=sum(x['income'] for x in rows);fuel=sum(x['fuel'] for x in rows);fee=sum(x['commission'] for x in allrows(db,'SELECT * FROM ledger WHERE driverId=? AND created>=?',u['id'],int(datetime.combine(start,datetime.min.time(),TZ).timestamp()*1000)))
     return {'income':income,'fuel':fuel,'commission':fee,'net':income-fuel-fee,'km':sum(x['endKm']-x['startKm'] for x in rows),'days':len(rows)}
   if path=='me' and method=='DELETE':
-   db.execute('BEGIN IMMEDIATE')
+   db.execute('BEGIN IMMEDIATE');rural.rollover(db,now())
+   must(not one(db,"SELECT 1 FROM rural_queue WHERE driverId=? AND state IN ('queued','departed')",u['id']) and not one(db,"SELECT 1 FROM rural_bookings WHERE passengerId=? AND state IN ('reserved','travelling')",u['id']),'Ауыл сапарын аяқтаңыз немесе броньды жойыңыз',409)
    if u['role']=='driver':must(not billing.outstanding(db,u['id']),'Алдымен комиссия берешегін жабыңыз',409)
    must(not one(db,"SELECT id FROM orders WHERE (passengerId=? OR driverId=?) AND state IN ('open','accepted','in_progress')",u['id'],u['id']),'Белсенді сапарларды аяқтаңыз',409)
    db.execute('DELETE FROM quotes WHERE userId=?',(u['id'],));db.execute('DELETE FROM sessions WHERE userId=?',(u['id'],));db.execute('DELETE FROM journal WHERE userId=?',(u['id'],));db.execute('DELETE FROM offers WHERE driverId=?',(u['id'],));db.execute('DELETE FROM locations WHERE driverId=?',(u['id'],));db.execute('UPDATE users SET phone=?,name=?,salt=?,hash=?,deleted=1 WHERE id=?',('deleted-'+uid(),'Жойылған пайдаланушы',uid(),uid(),u['id']))

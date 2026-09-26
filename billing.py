@@ -1,5 +1,6 @@
 """Manual bank reconciliation: OCR is advisory, never payment authorization."""
 import base64,hashlib,hmac,os,secrets,re,sqlite3
+import rural
 from fastapi.responses import Response
 
 HOURS=14*60*60*1000
@@ -38,6 +39,7 @@ def handle(path,method,b,req,db,u,now,must,uid,digest,password):
  if path.startswith('admin/'):
   token=req.headers.get('authorization','').removeprefix('Bearer ')
   must(db.execute('SELECT 1 FROM admin_sessions WHERE token=? AND expires>?',(digest(token),now)).fetchone(),'Админ ретінде кіріңіз',401)
+  if path.startswith('admin/rural/'):return rural.admin(path,method,b,db,now,must,uid)
   if path=='admin/logout':db.execute('DELETE FROM admin_sessions WHERE token=?',(digest(token),));db.commit();return {'ok':True}
   if path=='admin/summary':
    total=db.execute('SELECT COALESCE(SUM(commission),0) FROM ledger').fetchone()[0]
@@ -72,7 +74,7 @@ def handle(path,method,b,req,db,u,now,must,uid,digest,password):
   except Exception:must(False,'Чек файлы дұрыс емес')
   must(0<len(data)<=3*1024*1024,'Чек 3 МБ-тан аспасын')
   must((mime=='image/jpeg' and data.startswith(b'\xff\xd8\xff')) or (mime=='image/png' and data.startswith(b'\x89PNG\r\n\x1a\n')),'Файл сурет емес')
-  sha=hashlib.sha256(data).hexdigest();must(not db.execute('SELECT 1 FROM receipts WHERE sha=?',(sha,)).fetchone(),'Бұл чек бұрын жіберілген',409)
+  sha=hashlib.sha256(data).hexdigest();must(not db.execute('SELECT 1 FROM rural_receipts WHERE sha=?',(sha,)).fetchone(),'Бұл чек бұрын жіберілген',409);must(not db.execute('SELECT 1 FROM receipts WHERE sha=?',(sha,)).fetchone(),'Бұл чек бұрын жіберілген',409)
   rows=outstanding(db,u['id']);rid=uid();ocr=str(b.get('ocr',''))[:10000]
   db.execute('INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(rid,u['id'],sum(r['commission'] for r in rows),json.dumps([r['orderId'] for r in rows]),'pending',now,None,'',mime,data,sha,ocr));db.commit();return {'id':rid,'status':'pending'}
  must(False,'Табылмады',404)

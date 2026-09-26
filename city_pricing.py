@@ -54,3 +54,20 @@ def arrival_eta(order_id,location,pickup):
  if len(_eta_cache)>500:_eta_cache.clear()
  _eta_cache[order_id]=(time.monotonic(),minutes)
  return minutes
+
+
+def route_geometry(points):
+ global _last_request
+ base=os.environ.get('ROUTING_URL','https://routing.openstreetmap.de/routed-car/route/v1/driving').rstrip('/')
+ coords=';'.join(str(p['lon'])+','+str(p['lat']) for p in points)
+ url=base+'/'+coords+'?overview=full&geometries=geojson&steps=false&alternatives=false&radiuses='+';'.join(['150']*len(points))
+ with _routing_lock:
+  delay=1.05-(time.monotonic()-_last_request)
+  if delay>0:time.sleep(delay)
+  _last_request=time.monotonic()
+  req=urllib.request.Request(url,headers={'User-Agent':'YntalyTaxi/0.5 (https://yntaly-taxi.onrender.com)'})
+  with urllib.request.urlopen(req,timeout=20) as response:data=json.load(response)
+ if data.get('code')!='Ok' or not data.get('routes'):raise ValueError('Route unavailable')
+ r=data['routes'][0];g=r.get('geometry',{})
+ if not 100<=r['distance']<=300000 or g.get('type')!='LineString' or len(g.get('coordinates',[]))<2:raise ValueError('Route invalid')
+ return {'distanceM':round(r['distance']),'geometry':g}
